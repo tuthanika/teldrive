@@ -83,6 +83,47 @@ func (a *apiService) UsersListChannels(ctx context.Context) ([]api.Channel, erro
 	return res, nil
 }
 
+func (a *apiService) UsersListTopics(ctx context.Context, params api.UsersListTopicsParams) ([]api.Topic, error) {
+	userId := auth.GetUser(ctx)
+	channelId, _ := strconv.ParseInt(params.ID, 10, 64)
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.newMiddlewares(ctx, 5)...)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+	_ = userId
+	topics := []api.Topic{}
+	err = client.Run(ctx, func(ctx context.Context) error {
+		channel, err := tgc.GetChannelById(ctx, client.API(), channelId)
+		if err != nil {
+			return err
+		}
+		topicsRes, err := client.API().MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+			Peer:  &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
+			Limit: 100,
+		})
+		if err != nil {
+			// If the channel is not a forum, it returns an error. We simply return empty topics.
+			return nil
+		}
+
+		for _, topic := range topicsRes.Topics {
+			if t, ok := topic.(*tg.ForumTopic); ok {
+				topics = append(topics, api.Topic{ID: t.ID, Name: t.Title})
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	sort.Slice(topics, func(i, j int) bool {
+		return topics[i].Name < topics[j].Name
+	})
+
+	return topics, nil
+}
+
 func (a *apiService) UsersCreateChannel(ctx context.Context, req *api.Channel) error {
 	userID := auth.GetUser(ctx)
 	_, err := a.channelManager.CreateNewChannel(ctx, req.ChannelName, userID, false)
@@ -282,6 +323,7 @@ func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
 	userId := auth.GetUser(ctx)
 	var (
 		channelId int64
+		topicId   int
 		err       error
 	)
 
@@ -290,35 +332,67 @@ func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
 		channelId = 0
 	}
 
+	if channelId != 0 {
+		var channel models.Channel
+		if err := a.db.Where("user_id = ?", userId).Where("channel_id = ?", channelId).Where("selected = ?", true).First(&channel).Error; err == nil {
+			if channel.TopicId != nil {
+				topicId = *channel.TopicId
+			}
+		}
+	}
+
 	tokens, err := a.channelManager.BotTokens(ctx, userId)
 
 	if err != nil {
 		tokens = []string{}
 	}
-	return &api.UserConfig{Bots: tokens, ChannelId: channelId}, nil
+	res := &api.UserConfig{Bots: tokens, ChannelId: channelId}
+	if topicId != 0 {
+		res.TopicId = api.NewOptInt(topicId)
+	}
+	return res, nil
 }
 
 func (a *apiService) UsersUpdateChannel(ctx context.Context, req *api.ChannelUpdate) error {
 	userId := auth.GetUser(ctx)
 
-	channel := &models.Channel{UserId: userId, Selected: true}
-
-	if req.ChannelId.Value != 0 {
-		channel.ChannelId = req.ChannelId.Value
-	}
-	if req.ChannelName.Value != "" {
-		channel.ChannelName = req.ChannelName.Value
+	if req.ChannelId.Value == 0 {
+		return &apiError{err: errors.New("channel_id is required"), code: 400}
 	}
 
-	if err := a.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "channel_id"}},
-		DoUpdates: clause.Assignments(map[string]any{"selected": true}),
-	}).Create(channel).Error; err != nil {
-		return &apiError{err: errors.New("failed to update channel")}
+	channelId := req.ChannelId.Value
+	channelName := req.ChannelName.Value
+
+	// If no channel name provided, try to use existing or fall back to ID string
+	if channelName == "" {
+		var existing models.Channel
+		if err := a.db.Where("channel_id = ? AND user_id = ?", channelId, userId).First(&existing).Error; err == nil {
+			channelName = existing.ChannelName
+		}
+		if channelName == "" {
+			channelName = fmt.Sprintf("%d", channelId)
+		}
 	}
-	a.db.Model(&models.Channel{}).Where("channel_id != ?", channel.ChannelId).
+
+	var topicId *int
+	if req.TopicId.IsSet() && req.TopicId.Value != 0 {
+		topicId = &req.TopicId.Value
+	}
+
+	if err := a.db.Exec(`
+		INSERT INTO teldrive.channels (channel_id, channel_name, user_id, selected, topic_id)
+		VALUES (?, ?, ?, true, ?)
+		ON CONFLICT (channel_id) DO UPDATE SET
+			selected = true,
+			channel_name = COALESCE(NULLIF(EXCLUDED.channel_name, ''), teldrive.channels.channel_name),
+			topic_id = EXCLUDED.topic_id
+	`, channelId, channelName, userId, topicId).Error; err != nil {
+		return &apiError{err: fmt.Errorf("failed to update channel: %w", err)}
+	}
+
+	a.db.Model(&models.Channel{}).Where("channel_id != ?", channelId).
 		Where("user_id = ?", userId).Update("selected", false)
 
-	a.cache.Set(ctx, cache.KeyUserChannel(userId), channel.ChannelId, 0)
+	a.cache.Set(ctx, cache.KeyUserChannel(userId), channelId, 0)
 	return nil
 }

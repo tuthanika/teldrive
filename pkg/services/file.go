@@ -245,6 +245,17 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 			channelId = fileIn.ChannelId.Value
 		}
 		fileDB.ChannelId = &channelId
+
+		var topicId int
+		if fileIn.TopicId.Value == 0 {
+			topicId, _ = ResolveTopicID(a.db, fileDB.ParentId)
+		} else {
+			topicId = fileIn.TopicId.Value
+		}
+		if topicId != 0 {
+			fileDB.TopicId = &topicId
+		}
+
 		fileDB.MimeType = fileIn.MimeType.Value
 		fileDB.Category = utils.Ptr(string(category.GetCategory(fileIn.Name)))
 
@@ -317,9 +328,9 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 		if err := tx.Raw(`
 			INSERT INTO teldrive.files (
 				name, parent_id, user_id, mime_type, category, parts,
-				size, type, encrypted, updated_at, channel_id, status, hash
+				size, type, encrypted, updated_at, channel_id, topic_id, status, hash
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (name, COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), user_id)
 			WHERE status = 'active'
 			DO UPDATE SET
@@ -331,13 +342,14 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 				encrypted = EXCLUDED.encrypted,
 				updated_at = EXCLUDED.updated_at,
 				channel_id = EXCLUDED.channel_id,
+				topic_id = EXCLUDED.topic_id,
 				status = EXCLUDED.status,
 				hash = EXCLUDED.hash
 			RETURNING *
 		`,
 			fileDB.Name, fileDB.ParentId, fileDB.UserId, fileDB.MimeType,
 			fileDB.Category, fileDB.Parts, fileDB.Size, fileDB.Type,
-			fileDB.Encrypted, fileDB.UpdatedAt, fileDB.ChannelId, fileDB.Status,
+			fileDB.Encrypted, fileDB.UpdatedAt, fileDB.ChannelId, fileDB.TopicId, fileDB.Status,
 			fileDB.Hash,
 		).Scan(&fileDB).Error; err != nil {
 			return err
@@ -711,6 +723,10 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		updateDb.ChannelId = utils.Ptr(req.ChannelId.Value)
 	}
 
+	if req.TopicId.IsSet() && req.TopicId.Value != 0 {
+		updateDb.TopicId = utils.Ptr(req.TopicId.Value)
+	}
+
 	if req.Size.IsSet() && req.Size.Value != 0 && len(req.Parts) > 0 {
 		updateDb.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(req.Parts)))
 		updateDb.Size = utils.Ptr(req.Size.Value)
@@ -753,11 +769,8 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		}
 
 		// Build update query - explicitly select UpdatedAt if it's the only change
+		// Build update query
 		query := tx.Model(&models.File{}).Where("id = ?", params.ID)
-		if req.UpdatedAt.IsSet() && !isContentUpdate {
-			// Force update of updated_at field even when only metadata changes
-			query = query.Select("updated_at")
-		}
 		if err := query.Updates(updateDb).Error; err != nil {
 			return err
 		}

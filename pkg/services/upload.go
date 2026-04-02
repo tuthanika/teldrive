@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -172,10 +173,49 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 	}
 
 	document := docBuilder
-	sender := message.NewSender(client)
-	target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
+	peer := &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash}
 
-	res, err := target.Media(ctx, document)
+	var res tg.UpdatesClass
+	if params.TopicId.Set && params.TopicId.Value != 0 {
+		// Send to a specific forum topic using raw API with reply_to.
+		// Build InputMediaUploadedDocument manually so we can use MessagesSendMedia.
+		var randID int64
+		if err = binary.Read(rand.Reader, binary.LittleEndian, &randID); err != nil {
+			return nil, err
+		}
+		// Build MIME type and attributes same as docBuilder logic
+		topicMIME := "application/octet-stream"
+		topicAttrs := []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeFilename{FileName: params.PartName},
+		}
+		ext := strings.ToLower(params.PartName)
+		if uploadAsMedia {
+			if strings.HasSuffix(ext, ".mp4") || strings.HasSuffix(ext, ".mkv") || strings.HasSuffix(ext, ".mov") {
+				topicMIME = "video/mp4"
+				topicAttrs = append(topicAttrs, &tg.DocumentAttributeVideo{SupportsStreaming: true, W: 1280, H: 720})
+			} else if strings.HasSuffix(ext, ".mp3") || strings.HasSuffix(ext, ".m4a") || strings.HasSuffix(ext, ".flac") || strings.HasSuffix(ext, ".ogg") {
+				topicMIME = "audio/mpeg"
+				topicAttrs = append(topicAttrs, &tg.DocumentAttributeAudio{})
+			} else if strings.HasSuffix(ext, ".jpg") || strings.HasSuffix(ext, ".jpeg") || strings.HasSuffix(ext, ".png") || strings.HasSuffix(ext, ".webp") || strings.HasSuffix(ext, ".gif") {
+				topicMIME = "image/jpeg"
+				topicAttrs = append(topicAttrs, &tg.DocumentAttributeImageSize{W: 1280, H: 720})
+			}
+		}
+		mediaDoc := &tg.InputMediaUploadedDocument{
+			File:       upload,
+			MimeType:   topicMIME,
+			Attributes: topicAttrs,
+		}
+		res, err = client.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+			Peer:     peer,
+			Media:    mediaDoc,
+			ReplyTo:  &tg.InputReplyToMessage{ReplyToMsgID: params.TopicId.Value},
+			RandomID: randID,
+		})
+	} else {
+		sender := message.NewSender(client)
+		res, err = sender.To(peer).Media(ctx, document)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -214,22 +254,24 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	)
 
 	channelId := params.ChannelId.Value
-	if channelId == 0 {
-		var err error
-		var parentIdPtr *string
-		if params.Path.Value != "" {
-			parentIdPtr, err = resolvePathID(a.db, params.Path.Value, userId)
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, &apiError{err: err}
-			}
+	var (
+		err         error
+		parentIdPtr *string
+	)
+	if params.Path.Value != "" {
+		parentIdPtr, err = resolvePathID(a.db, params.Path.Value, userId)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, &apiError{err: err}
 		}
+	}
+	if channelId == 0 {
 		channelId, err = ResolveChannelID(a.db, parentIdPtr)
 		if err != nil {
 			return nil, &apiError{err: err}
 		}
 		if channelId == 0 {
 			channelId, err = a.channelManager.CurrentChannel(ctx, userId)
-			if err != nil && err != tgc.ErrNoDefaultChannel {
+			if err != nil && !errors.Is(err, tgc.ErrNoDefaultChannel) {
 				return nil, &apiError{err: err}
 			}
 			if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
@@ -242,9 +284,26 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 				logger.Debug("channel.created", zap.Int64("new_channel_id", channelId))
 			}
 		}
+	}
 
-	} else {
-		channelId = params.ChannelId.Value
+	topicId := params.TopicId.Value
+	if topicId == 0 && params.ChannelId.Value == 0 {
+		topicId, err = ResolveTopicID(a.db, parentIdPtr)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, &apiError{err: err}
+		}
+		if topicId != 0 {
+			params.TopicId = api.NewOptInt(topicId)
+		} else {
+			// Try to resolve topicId if we resolved channelId from DB
+			var dbFile models.File
+			if err := a.db.Where("user_id = ?", userId).Where("channel_id = ?", channelId).Where("topic_id IS NOT NULL").Order("updated_at DESC").First(&dbFile).Error; err == nil {
+				if dbFile.TopicId != nil {
+					topicId = *dbFile.TopicId
+					params.TopicId = api.NewOptInt(topicId)
+				}
+			}
+		}
 	}
 
 	client, token, index, channelUser, err := a.getUploadClient(ctx, userId)

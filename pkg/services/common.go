@@ -132,10 +132,34 @@ func ResolveChannelID(db *gorm.DB, parentId *string) (int64, error) {
 	LIMIT 1;
 	`
 	if err := db.Raw(query, *parentId).Scan(&channelId).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return 0, nil
-		}
 		return 0, err
 	}
 	return channelId, nil
+}
+
+func ResolveTopicID(db *gorm.DB, parentId *string) (int, error) {
+	if parentId == nil {
+		return 0, nil
+	}
+	var topicId int
+	query := `
+	WITH RECURSIVE hierarchy AS (
+		SELECT id, parent_id, topic_id, 1 as depth
+		FROM teldrive.files
+		WHERE id = ? AND status = 'active'
+		UNION ALL
+		SELECT p.id, p.parent_id, p.topic_id, h.depth + 1
+		FROM teldrive.files p
+		JOIN hierarchy h ON h.parent_id = p.id
+		WHERE p.status = 'active'
+	)
+	SELECT topic_id FROM hierarchy
+	WHERE topic_id IS NOT NULL
+	ORDER BY depth ASC
+	LIMIT 1;
+	`
+	if err := db.Raw(query, *parentId).Scan(&topicId).Error; err != nil {
+		return 0, err
+	}
+	return topicId, nil
 }
