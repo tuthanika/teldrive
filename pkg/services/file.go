@@ -231,9 +231,15 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 		fileDB.Parts = nil
 	case api.FileTypeFile:
 		if fileIn.ChannelId.Value == 0 {
-			channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+			channelId, err = ResolveChannelID(a.db, fileDB.ParentId)
 			if err != nil {
 				return nil, &apiError{err: err}
+			}
+			if channelId == 0 {
+				channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+				if err != nil {
+					return nil, &apiError{err: err}
+				}
 			}
 		} else {
 			channelId = fileIn.ChannelId.Value

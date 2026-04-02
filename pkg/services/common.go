@@ -109,3 +109,33 @@ func resolvePathID(db *gorm.DB, path string, userId int64) (*string, error) {
 	}
 	return &id, nil
 }
+
+func ResolveChannelID(db *gorm.DB, parentId *string) (int64, error) {
+	if parentId == nil {
+		return 0, nil
+	}
+	var channelId int64
+	query := `
+	WITH RECURSIVE hierarchy AS (
+		SELECT id, parent_id, channel_id, 1 as depth
+		FROM teldrive.files
+		WHERE id = ? AND status = 'active'
+		UNION ALL
+		SELECT p.id, p.parent_id, p.channel_id, h.depth + 1
+		FROM teldrive.files p
+		JOIN hierarchy h ON h.parent_id = p.id
+		WHERE p.status = 'active'
+	)
+	SELECT channel_id FROM hierarchy
+	WHERE channel_id IS NOT NULL
+	ORDER BY depth ASC
+	LIMIT 1;
+	`
+	if err := db.Raw(query, *parentId).Scan(&channelId).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return channelId, nil
+}

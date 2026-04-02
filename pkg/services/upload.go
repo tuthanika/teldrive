@@ -21,6 +21,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/pool"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
@@ -143,7 +144,12 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 
 	docBuilder := message.UploadedDocument(upload).Filename(params.PartName)
 
-	if a.cnf.TG.Uploads.UploadAsMedia {
+	uploadAsMedia := a.cnf.TG.Uploads.UploadAsMedia
+	if params.UploadAsMedia.Set {
+		uploadAsMedia = params.UploadAsMedia.Value
+	}
+
+	if uploadAsMedia {
 		ext := strings.ToLower(params.PartName)
 		if strings.HasSuffix(ext, ".mp4") || strings.HasSuffix(ext, ".mkv") || strings.HasSuffix(ext, ".mov") {
 			docBuilder = docBuilder.MIME("video/mp4").Attributes(&tg.DocumentAttributeVideo{
@@ -210,18 +216,31 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	channelId := params.ChannelId.Value
 	if channelId == 0 {
 		var err error
-		channelId, err = a.channelManager.CurrentChannel(ctx, userId)
-		if err != nil && err != tgc.ErrNoDefaultChannel {
-			return nil, &apiError{err: err}
-		}
-		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
-			newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
-			if err != nil {
-				logger.Error("channel.create.failed", zap.Error(err))
+		var parentIdPtr *string
+		if params.Path.Value != "" {
+			parentIdPtr, err = resolvePathID(a.db, params.Path.Value, userId)
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, &apiError{err: err}
 			}
-			channelId = newChannelId
-			logger.Debug("channel.created", zap.Int64("new_channel_id", channelId))
+		}
+		channelId, err = ResolveChannelID(a.db, parentIdPtr)
+		if err != nil {
+			return nil, &apiError{err: err}
+		}
+		if channelId == 0 {
+			channelId, err = a.channelManager.CurrentChannel(ctx, userId)
+			if err != nil && err != tgc.ErrNoDefaultChannel {
+				return nil, &apiError{err: err}
+			}
+			if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
+				newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
+				if err != nil {
+					logger.Error("channel.create.failed", zap.Error(err))
+					return nil, &apiError{err: err}
+				}
+				channelId = newChannelId
+				logger.Debug("channel.created", zap.Int64("new_channel_id", channelId))
+			}
 		}
 
 	} else {
