@@ -167,6 +167,7 @@ type TGUpload struct {
 	Threads       int           `default:"8" description:"Number of upload threads"`
 	MaxRetries    int           `default:"10" description:"Maximum upload retry attempts"`
 	Retention     time.Duration `default:"7d" description:"Upload retention period"`
+	UploadAsMedia bool          `default:"false" description:"Upload valid media files without ForceFile"`
 }
 type TGConfig struct {
 	RateLimit         bool          `default:"true" description:"Enable rate limiting for API calls"`

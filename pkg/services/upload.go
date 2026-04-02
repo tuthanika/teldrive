@@ -141,7 +141,31 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 		return nil, err
 	}
 
-	document := message.UploadedDocument(upload).Filename(params.PartName).ForceFile(true)
+	docBuilder := message.UploadedDocument(upload).Filename(params.PartName)
+
+	if a.cnf.TG.Uploads.UploadAsMedia {
+		ext := strings.ToLower(params.PartName)
+		if strings.HasSuffix(ext, ".mp4") || strings.HasSuffix(ext, ".mkv") || strings.HasSuffix(ext, ".mov") {
+			docBuilder = docBuilder.MIME("video/mp4").Attributes(&tg.DocumentAttributeVideo{
+				SupportsStreaming: true,
+				W: 1280,
+				H: 720,
+			})
+		} else if strings.HasSuffix(ext, ".mp3") || strings.HasSuffix(ext, ".m4a") || strings.HasSuffix(ext, ".flac") || strings.HasSuffix(ext, ".ogg") {
+			docBuilder = docBuilder.MIME("audio/mpeg").Attributes(&tg.DocumentAttributeAudio{})
+		} else if strings.HasSuffix(ext, ".jpg") || strings.HasSuffix(ext, ".jpeg") || strings.HasSuffix(ext, ".png") || strings.HasSuffix(ext, ".webp") || strings.HasSuffix(ext, ".gif") {
+			docBuilder = docBuilder.MIME("image/jpeg").Attributes(&tg.DocumentAttributeImageSize{
+				W: 1280,
+				H: 720,
+			})
+		} else {
+			docBuilder = docBuilder.ForceFile(true)
+		}
+	} else {
+		docBuilder = docBuilder.ForceFile(true)
+	}
+
+	document := docBuilder
 	sender := message.NewSender(client)
 	target := sender.To(&tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash})
 
