@@ -207,7 +207,7 @@ func GetBotInfo(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *co
 	return &types.BotInfo{Id: user.ID, UserName: user.Username, Token: token}, nil
 }
 
-func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId int64) (location *tg.InputDocumentFileLocation, err error) {
+func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId int64) (location tg.InputFileLocationClass, err error) {
 
 	channel, err := GetChannelById(ctx, client, channelId)
 
@@ -234,13 +234,56 @@ func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId
 	case *tg.MessageEmpty:
 		return nil, errors.New("no messages found")
 	case *tg.Message:
-		media := item.Media.(*tg.MessageMediaDocument)
-		document := media.Document.(*tg.Document)
-		location = document.AsInputDocumentFileLocation()
+		switch media := item.Media.(type) {
+		case *tg.MessageMediaDocument:
+			if doc, ok := media.Document.(*tg.Document); ok {
+				return doc.AsInputDocumentFileLocation(), nil
+			}
+		case *tg.MessageMediaPhoto:
+			if photo, ok := media.Photo.(*tg.Photo); ok {
+				var largestThumb string
+				var maxSize int
+				for _, sz := range photo.Sizes {
+					switch size := sz.(type) {
+					case *tg.PhotoSize:
+						if size.Size > maxSize {
+							maxSize = size.Size
+							largestThumb = size.Type
+						}
+					case *tg.PhotoSizeProgressive:
+						if 9999999 > maxSize {
+							maxSize = 9999999
+							largestThumb = size.Type
+						}
+					}
+				}
+				
+				// Fallback to the last size if still empty somehow
+				if largestThumb == "" && len(photo.Sizes) > 0 {
+					last := photo.Sizes[len(photo.Sizes)-1]
+					switch size := last.(type) {
+					case *tg.PhotoSize:
+						largestThumb = size.Type
+					case *tg.PhotoSizeProgressive:
+						largestThumb = size.Type
+					case *tg.PhotoCachedSize:
+						largestThumb = size.Type
+					case *tg.PhotoStrippedSize:
+						largestThumb = size.Type
+					}
+				}
 
+				return &tg.InputPhotoFileLocation{
+					ID:            photo.ID,
+					AccessHash:    photo.AccessHash,
+					FileReference: photo.FileReference,
+					ThumbSize:     largestThumb,
+				}, nil
+			}
+		}
 	}
 
-	return location, nil
+	return nil, errors.New("unexpected message or media format")
 }
 
 func CalculateChunkSize(start, end int64) int64 {

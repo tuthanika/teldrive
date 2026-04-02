@@ -41,24 +41,51 @@ func (c *chunkSource) ChunkSize(start, end int64) int64 {
 	return tgc.CalculateChunkSize(start, end)
 }
 
+type CachedLocation struct {
+	Type     string
+	Document *tg.InputDocumentFileLocation
+	Photo    *tg.InputPhotoFileLocation
+}
+
 func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
 	var (
-		location tg.InputDocumentFileLocation
-		err      error
+		cachedLoc CachedLocation
+		location  tg.InputFileLocationClass
+		err       error
 	)
 
-	err = c.cache.Get(ctx, c.key, &location)
+	err = c.cache.Get(ctx, c.key, &cachedLoc)
 
 	if err != nil {
 		loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
 		if err != nil {
 			return nil, err
 		}
-		c.cache.Set(ctx, c.key, loc, 30*time.Minute)
-		location = *loc
+		
+		switch l := loc.(type) {
+		case *tg.InputDocumentFileLocation:
+			cachedLoc = CachedLocation{Type: "document", Document: l}
+		case *tg.InputPhotoFileLocation:
+			cachedLoc = CachedLocation{Type: "photo", Photo: l}
+		}
+		
+		c.cache.Set(ctx, c.key, cachedLoc, 30*time.Minute)
+		location = loc
+	} else {
+		if cachedLoc.Type == "document" && cachedLoc.Document != nil {
+			location = cachedLoc.Document
+		} else if cachedLoc.Type == "photo" && cachedLoc.Photo != nil {
+			location = cachedLoc.Photo
+		} else {
+			loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
+			if err != nil {
+				return nil, err
+			}
+			location = loc
+		}
 	}
 
-	return tgc.GetChunk(ctx, c.client, &location, offset, limit)
+	return tgc.GetChunk(ctx, c.client, location, offset, limit)
 
 }
 

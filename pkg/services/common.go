@@ -33,21 +33,29 @@ func getParts(ctx context.Context, client *telegram.Client, c cache.Cacher, file
 		for i, message := range messages {
 			switch item := message.(type) {
 			case *tg.Message:
-				media, ok := item.Media.(*tg.MessageMediaDocument)
-				if !ok {
+				var partSize int64
+				switch media := item.Media.(type) {
+				case *tg.MessageMediaDocument:
+					if doc, ok := media.Document.(*tg.Document); ok {
+						partSize = doc.Size
+					}
+				case *tg.MessageMediaPhoto:
+					if file.Size != nil {
+						partSize = *file.Size
+					}
+				}
+
+				if partSize == 0 {
 					continue
 				}
-				document, ok := media.Document.(*tg.Document)
-				if !ok {
-					continue
-				}
+
 				part := types.Part{
 					ID:   int64((*file.Parts)[i].ID),
-					Size: document.Size,
+					Size: partSize,
 					Salt: (*file.Parts)[i].Salt.Value,
 				}
 				if *file.Encrypted {
-					part.DecryptedSize, _ = crypt.DecryptedSize(document.Size)
+					part.DecryptedSize, _ = crypt.DecryptedSize(partSize)
 				}
 				parts = append(parts, part)
 			}
