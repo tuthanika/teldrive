@@ -2,16 +2,20 @@ package cron
 
 import (
 	"context"
+	"strconv"
+    "strings"
 	"time"
 
 	gormlock "github.com/go-co-op/gocron-gorm-lock/v2"
 	"github.com/go-co-op/gocron/v2"
 	"github.com/jackc/pgx/v5/pgtype"
+	rcron "github.com/robfig/cron/v3"
 	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/tgdrive/teldrive/pkg/services"
 	"go.uber.org/zap"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -84,9 +88,20 @@ func StartCronJobs(ctx context.Context, db *gorm.DB, cnf *config.ServerCmdConfig
 	if err != nil {
 		return err
 	}
+	_, err = scheduler.NewJob(gocron.DurationJob(time.Minute),
+		gocron.NewTask(cron.scanTasks, ctx))
+	if err != nil {
+		return err
+	}
 
+	cron.ResetTasks()
 	scheduler.Start()
 	return nil
+}
+
+func (c *CronService) ResetTasks() {
+	c.logger.Info("cron.reset_tasks.started")
+	c.db.Model(&models.ScanTask{}).Where("status = ?", "running").Update("status", "waiting")
 }
 
 func (c *CronService) cleanFiles(ctx context.Context) {
@@ -227,4 +242,193 @@ func (c *CronService) updateFolderSize() {
 
 func (c *CronService) cleanOldEvents() {
 	c.db.Exec("DELETE FROM teldrive.events WHERE created_at < NOW() - INTERVAL '5 days';")
+}
+func (c *CronService) scanTasks(ctx context.Context) {
+	// 0. Queue due scheduled tasks (cron/legacy datetime)
+	now := time.Now().UTC()
+	c.cleanExpiredScanTaskLogs(now)
+	c.queueDueScheduledTasks(now)
+
+	// 1. Get Concurrency Limit
+	limit := c.cnf.CronJobs.ScanConcurrency
+	if limit < 1 {
+		limit = 1
+	}
+	var entry struct {
+		Value []byte
+	}
+	if err := c.db.Table("teldrive.kv").Select("value").Where("key = ?", "scan_concurrency").First(&entry).Error; err == nil {
+		if l, err := strconv.Atoi(string(entry.Value)); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	// 1. Audit Check
+	var totalTasks int64
+	c.db.Model(&models.ScanTask{}).Count(&totalTasks)
+	c.logger.Info("cron.scan_tasks.audit", zap.Int64("total_db_tasks", totalTasks))
+
+	// 2. Count Active Tasks
+	var activeCount int64
+	c.db.Model(&models.ScanTask{}).Where("status = ?", "running").Count(&activeCount)
+
+	slotsAvailable := int(int64(limit) - activeCount)
+	c.logger.Info("cron.scan_tasks.concurrency", zap.Int("limit", limit), zap.Int64("active", activeCount), zap.Int("slots", slotsAvailable))
+
+	if slotsAvailable <= 0 {
+		return
+	}
+
+	// 3. Find Waiting Tasks up to available slots
+	var tasks []models.ScanTask
+	if err := c.db.Where("status = ?", "waiting").Limit(slotsAvailable).Find(&tasks).Error; err != nil {
+		c.logger.Error("cron.scan_tasks.query_failed", zap.Error(err))
+		return
+	}
+
+	if len(tasks) == 0 {
+		return
+	}
+
+	taskIds := make([]string, len(tasks))
+	for i, t := range tasks {
+		taskIds[i] = t.ID
+	}
+	c.logger.Info("cron.scan_tasks.found", zap.Int("count", len(tasks)), zap.Strings("task_ids", taskIds))
+
+	for _, t := range tasks {
+		// Atomic update to ensure we claim the task
+		res := c.db.Model(&models.ScanTask{}).Where("id = ? AND status = ?", t.ID, "waiting").Update("status", "running")
+		if res.RowsAffected == 0 {
+			continue // Already claimed by another process
+		}
+
+		go func(task models.ScanTask) {
+			c.logger.Info("cron.scan_task.starting", zap.String("task_id", task.ID))
+			taskCtx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+			defer cancel()
+
+			// Safety defer: if the worker exits and the task is still 'running', mark it as 'failed'
+			defer func() {
+				var finalTask models.ScanTask
+				if err := c.db.First(&finalTask, "id = ?", task.ID).Error; err == nil {
+					if finalTask.Status == "running" {
+						c.db.Model(&models.ScanTask{}).Where("id = ?", task.ID).Update("status", "failed")
+					}
+				}
+			}()
+
+			worker := services.NewScanTaskWorker(c.db, c.cnf, c.logger)
+			if err := worker.ProcessTask(taskCtx, task.ID); err != nil {
+				c.logger.Error("cron.scan_task.failed", zap.String("task_id", task.ID), zap.Error(err))
+			}
+		}(t)
+	}
+}
+
+func (c *CronService) cleanExpiredScanTaskLogs(now time.Time) {
+	retentionDays := c.cnf.CronJobs.ScanLogRetentionDays
+	if retentionDays < 1 {
+		retentionDays = 3
+	}
+	threshold := now.AddDate(0, 0, -retentionDays)
+	c.db.Model(&models.ScanTask{}).
+		Where("updated_at < ?", threshold).
+		Where("logs IS NOT NULL").
+		Where("logs::text <> '[]'").
+		Update("logs", datatypes.JSON([]byte("[]")))
+}
+
+func (c *CronService) queueDueScheduledTasks(now time.Time) {
+	var scheduledTasks []models.ScanTask
+	if err := c.db.Where("schedule <> ''").Where("status IN ?", []string{"scheduled", "completed", "paused", "pause"}).Find(&scheduledTasks).Error; err != nil {
+		c.logger.Error("cron.scan_tasks.schedule_query_failed", zap.Error(err))
+		return
+	}
+
+	for _, task := range scheduledTasks {
+		if !c.shouldQueueTask(task, now) {
+			continue
+		}
+
+		res := c.db.Model(&models.ScanTask{}).
+			Where("id = ? AND status = ?", task.ID, task.Status).
+			Update("status", "waiting")
+		if res.Error != nil {
+			c.logger.Error("cron.scan_tasks.schedule_update_failed", zap.String("task_id", task.ID), zap.Error(res.Error))
+			continue
+		}
+		if res.RowsAffected > 0 {
+			c.logger.Info("cron.scan_tasks.schedule_queued", zap.String("task_id", task.ID), zap.String("schedule", task.Schedule))
+		}
+	}
+}
+
+func (c *CronService) shouldQueueTask(task models.ScanTask, now time.Time) bool {
+	schedule := strings.TrimSpace(task.Schedule)
+	if schedule == "" {
+		return false
+	}
+
+	if spec, err := rcron.ParseStandard(schedule); err == nil {
+		// Keep old behavior for standard parser first.
+		// Supports 5-field specs and descriptors.
+		// fallthrough to extended parser only if needed.
+		currentMinute := now.Truncate(time.Minute)
+		nextDue := spec.Next(currentMinute.Add(-time.Minute))
+		if !nextDue.Equal(currentMinute) || !task.UpdatedAt.Before(currentMinute) {
+			return false
+		}
+
+		// Non-repeat cron tasks should run once only.
+		if !task.RepeatEnabled && task.Status == "completed" {
+			return false
+		}
+		return true
+	}
+
+	// Extended cron parser supports optional seconds field.
+	extendedParser := rcron.NewParser(
+		rcron.SecondOptional | rcron.Minute | rcron.Hour | rcron.Dom | rcron.Month | rcron.Dow | rcron.Descriptor,
+	)
+	if spec, err := extendedParser.Parse(schedule); err == nil {
+		// For cron schedule, queue only when current minute is exactly the next due slot.
+		// updated_at guard avoids duplicate re-queues within same minute.
+		currentMinute := now.Truncate(time.Minute)
+		nextDue := spec.Next(currentMinute.Add(-time.Minute))
+		if !nextDue.Equal(currentMinute) || !task.UpdatedAt.Before(currentMinute) {
+			return false
+		}
+
+		// Non-repeat cron tasks should run once only.
+		if !task.RepeatEnabled && task.Status == "completed" {
+			return false
+		}
+		return true
+	}
+
+	// Legacy one-time datetime support.
+	layouts := []string{
+		"2006-01-02T15:04",
+		"2006-01-02 15:04",
+		"2006-01-02T15:04:05",
+		time.RFC3339,
+	}
+	var when time.Time
+	var err error
+	for _, layout := range layouts {
+		when, err = time.ParseInLocation(layout, schedule, time.Local)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		c.logger.Debug("cron.scan_tasks.invalid_schedule", zap.String("task_id", task.ID), zap.String("schedule", schedule))
+		return false
+	}
+	if now.Before(when) {
+		return false
+	}
+	// One-time schedule: only queue from pending statuses.
+	return task.Status == "scheduled" || task.Status == "paused" || task.Status == "pause"
 }

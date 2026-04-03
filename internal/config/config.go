@@ -153,6 +153,8 @@ type CronJobConfig struct {
 	CleanFilesInterval   time.Duration `default:"1h" description:"Interval for cleaning expired files"`
 	CleanUploadsInterval time.Duration `default:"12h" description:"Interval for cleaning incomplete uploads"`
 	FolderSizeInterval   time.Duration `default:"2h" description:"Interval for updating folder sizes"`
+	ScanConcurrency      int           `default:"1" description:"Number of concurrent scan tasks"`
+	ScanLogRetentionDays int           `default:"3" description:"Number of days to retain scan task logs"`
 }
 
 type TGStream struct {
