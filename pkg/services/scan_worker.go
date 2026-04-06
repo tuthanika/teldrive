@@ -248,6 +248,7 @@ func (w *scanTaskWorker) processMedia(ctx context.Context, task *models.ScanTask
 	targetParentID := w.resolveFolder(ctx, task.UserID, task.FolderID)
 
 	// Apply mapping rules if enabled
+	ruleMatched := false
 	if task.RuleMode && task.RuleString != "" {
 		rules := strings.Split(task.RuleString, ",")
 		for _, rule := range rules {
@@ -257,11 +258,14 @@ func (w *scanTaskWorker) processMedia(ctx context.Context, task *models.ScanTask
 				subfolderName := strings.TrimSpace(parts[1])
 				if strings.HasSuffix(strings.ToLower(fileName), "."+ext) {
 					targetParentID = w.ensureSubfolder(ctx, task.UserID, targetParentID, subfolderName)
+					ruleMatched = true
 					break
 				}
 			}
 		}
-	} else if task.SplitMode {
+	}
+
+	if !ruleMatched && task.SplitMode {
 		cat := w.getCategory(fileName, mimeType)
 		targetParentID = w.ensureSubfolder(ctx, task.UserID, targetParentID, cat)
 	}
