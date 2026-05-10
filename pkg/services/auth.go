@@ -80,16 +80,22 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 		if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&user).Error; err != nil {
 			return err
 		}
-		file := &models.File{
-			Name:      "root",
-			Type:      "folder",
-			MimeType:  "drive/folder",
-			UserId:    session.UserId,
-			Status:    "active",
-			UpdatedAt: utils.Ptr(time.Now().UTC()),
-		}
-		if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(file).Error; err != nil {
+		var count int64
+		if err := a.db.Model(&models.File{}).Where("user_id = ? AND parent_id IS NULL AND name = 'root' AND status = 'active'", session.UserId).Count(&count).Error; err != nil {
 			return err
+		}
+		if count == 0 {
+			file := &models.File{
+				Name:      "root",
+				Type:      "folder",
+				MimeType:  "drive/folder",
+				UserId:    session.UserId,
+				Status:    "active",
+				UpdatedAt: utils.Ptr(time.Now().UTC()),
+			}
+			if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(file).Error; err != nil {
+				return err
+			}
 		}
 		return nil
 	})
